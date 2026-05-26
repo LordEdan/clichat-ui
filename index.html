@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover,interactive-widget=resizes-content" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
 <meta name="theme-color" content="#000000" id="meta-theme-color" />
 <title>404 未找到</title>
 <script>
@@ -61,18 +61,12 @@
   }
 
   * { box-sizing: border-box; }
-  html {
-    /* Lock zoom on iOS Safari, which ignores user-scalable=no in some versions. */
-    touch-action: manipulation;
-    -webkit-text-size-adjust: 100%;
-    text-size-adjust: 100%;
-  }
   html, body {
     margin: 0;
     padding: 0;
     background: var(--bg);
     color: var(--fg);
-    font: 15px/1.5 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", monospace;
+    font: 16px/1.5 "SF Mono", "Fira Code", "Fira Mono", "JetBrains Mono", "Cascadia Code", "Menlo", "Consolas", "DejaVu Sans Mono", monospace;
     -webkit-font-smoothing: antialiased;
     -webkit-tap-highlight-color: transparent;
   }
@@ -82,16 +76,6 @@
     display: flex;
     flex-direction: column;
     overscroll-behavior: none;
-  }
-
-  /* When chat is active we lock the page so iOS won't reflow on keyboard open. */
-  body.chat-active {
-    position: fixed;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    min-height: 0;
-    overflow: hidden;
   }
 
   .hidden { display: none !important; }
@@ -166,10 +150,10 @@
     border-radius: 10px;
     padding: 12px 14px;
     font: inherit;
+    font-size: 15px;
     color: var(--fg);
     outline: none;
     -webkit-appearance: none;
-    appearance: none;
     transition: border-color .15s, background .15s;
   }
   .field input:focus {
@@ -229,11 +213,6 @@
     min-height: 0;
     background: var(--bg);
   }
-  body.chat-active #chat-screen {
-    /* Track the visible viewport so the bar stays glued to the top
-       and the composer rides up with the keyboard, no jumping. */
-    height: var(--vvh, 100dvh);
-  }
 
   #bar {
     display: flex;
@@ -286,7 +265,6 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    overscroll-behavior: contain;
     padding: 8px 0;
     -webkit-overflow-scrolling: touch;
     display: flex;
@@ -356,13 +334,13 @@
     border-radius: 20px;
     padding: 10px 14px;
     font: inherit;
+    font-size: 15px;
     color: var(--fg);
     outline: none;
     resize: none;
     max-height: 120px;
     line-height: 1.4;
     -webkit-appearance: none;
-    appearance: none;
   }
   #composer textarea:focus {
     border-color: var(--accent);
@@ -546,6 +524,58 @@
   let reconnectTimer = null;
   let stopped = false;
   let cfg = null;
+  let keyBytes = null;
+  let cleanServerUrl = null;
+
+  // ===== 加密工具 (镜像 crypto.js，浏览器版) =====
+  const NONCE_LEN = 12;
+  function b64urlEncodeBytes(bytes) {
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  }
+  function b64urlDecodeBytes(str) {
+    const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
+    const bin = atob(str.replace(/-/g,'+').replace(/_/g,'/') + pad);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  async function importAesKey(bytes) {
+    return crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM' }, false, ['encrypt','decrypt']);
+  }
+  async function encryptStr(plaintext, kb) {
+    const key = await importAesKey(kb);
+    const nonce = crypto.getRandomValues(new Uint8Array(NONCE_LEN));
+    const data = new TextEncoder().encode(plaintext);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name:'AES-GCM', iv: nonce }, key, data));
+    const out = new Uint8Array(NONCE_LEN + ct.length);
+    out.set(nonce, 0); out.set(ct, NONCE_LEN);
+    return b64urlEncodeBytes(out);
+  }
+  async function decryptStr(ciphertext, kb) {
+    const buf = b64urlDecodeBytes(ciphertext);
+    if (buf.length < NONCE_LEN + 16) throw new Error('ciphertext too short');
+    const nonce = buf.subarray(0, NONCE_LEN);
+    const body = buf.subarray(NONCE_LEN);
+    const key = await importAesKey(kb);
+    const pt = await crypto.subtle.decrypt({ name:'AES-GCM', iv: nonce }, key, body);
+    return new TextDecoder().decode(pt);
+  }
+  function parsePsk(urlString) {
+    let base = urlString.trim();
+    base = base.replace(/^http:\/\//i, 'ws://').replace(/^https:\/\//i, 'wss://');
+    if (!/^wss?:\/\//i.test(base)) base = 'wss://' + base;
+    const u = new URL(base);
+    const hash = u.hash.startsWith('#') ? u.hash.slice(1) : u.hash;
+    if (!hash) throw new Error('服务器地址没有带 PSK fragment (#k=...)');
+    const k = new URLSearchParams(hash).get('k');
+    if (!k) throw new Error('fragment 里找不到 k=...');
+    const kb = b64urlDecodeBytes(k);
+    if (kb.length !== 32) throw new Error(`PSK 长度应为 32 字节，实际 ${kb.length}`);
+    u.hash = '';
+    return { cleanUrl: u.toString(), keyBytes: kb };
+  }
 
   const fmtTime = (ts) => {
     const d = new Date(ts);
@@ -584,14 +614,14 @@
     const wrap = document.createElement('div');
     wrap.className = 'msg' + (own ? ' me' : '');
 
-    if (m.replyTo) {
+    if (m.replyToQuote) {
       const r = document.createElement('div');
       r.className = 'reply';
       const rf = document.createElement('span');
       rf.className = 'reply-from';
-      rf.textContent = m.replyTo.from + ':';
+      rf.textContent = m.replyToQuote.from + ':';
       r.appendChild(rf);
-      r.appendChild(document.createTextNode(' ' + m.replyTo.content));
+      r.appendChild(document.createTextNode(' ' + m.replyToQuote.snippet));
       wrap.appendChild(r);
     }
 
@@ -627,10 +657,7 @@
   }
 
   function buildUrl() {
-    let base = cfg.server.trim();
-    base = base.replace(/^http:\/\//i, 'ws://').replace(/^https:\/\//i, 'wss://');
-    if (!/^wss?:\/\//i.test(base)) base = 'wss://' + base;
-    const u = new URL(base);
+    const u = new URL(cleanServerUrl);
     u.searchParams.set('name', cfg.name);
     u.searchParams.set('room', cfg.room);
     const since = getLastId();
@@ -664,28 +691,45 @@
       appendSys(`已落入 404 页面「${cfg.room}」，代号 ${cfg.name}`);
     });
 
+    async function decryptInPlace(m) {
+      if (m.type !== 'msg' || typeof m.content !== 'string') return;
+      try {
+        const plaintext = await decryptStr(m.content, keyBytes);
+        const parsed = JSON.parse(plaintext);
+        m.content = typeof parsed.text === 'string' ? parsed.text : '';
+        if (parsed.quote && typeof parsed.quote === 'object') m.replyToQuote = parsed.quote;
+      } catch {
+        m.content = '<密钥不匹配，无法解密>';
+      }
+    }
+
+    let chain = Promise.resolve();
     ws.addEventListener('message', (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === 'history') {
-        const arr = Array.isArray(msg.messages) ? msg.messages : [];
-        if (arr.length) appendSys(`离线期间 ${arr.length} 条留言`);
-        for (const m of arr) {
-          if (m.type === 'sys') appendSys(m.content);
-          else if (m.type === 'msg') appendMsg(m);
-          if (m.id) rememberLastId(m.id);
+      chain = chain.then(async () => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type === 'history') {
+          const arr = Array.isArray(msg.messages) ? msg.messages : [];
+          for (const m of arr) await decryptInPlace(m);
+          if (arr.length) appendSys(`离线期间 ${arr.length} 条留言`);
+          for (const m of arr) {
+            if (m.type === 'sys') appendSys(m.content);
+            else if (m.type === 'msg') appendMsg(m);
+            if (m.id) rememberLastId(m.id);
+          }
+          return;
         }
-        return;
-      }
-      if (msg.type === 'msg') {
-        appendMsg(msg);
-        if (msg.id) rememberLastId(msg.id);
-        return;
-      }
-      if (msg.type === 'sys') {
-        appendSys(msg.content);
-        return;
-      }
+        if (msg.type === 'msg') {
+          await decryptInPlace(msg);
+          appendMsg(msg);
+          if (msg.id) rememberLastId(msg.id);
+          return;
+        }
+        if (msg.type === 'sys') {
+          appendSys(msg.content);
+          return;
+        }
+      }).catch((err) => console.error('[clichat] message handler', err));
     });
 
     ws.addEventListener('close', (ev) => {
@@ -720,43 +764,14 @@
     ws = null;
   }
 
-  function send(content) {
+  async function send(content) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify({ type: 'msg', content }));
+    const ciphertext = await encryptStr(JSON.stringify({ text: content, quote: null }), keyBytes);
+    ws.send(JSON.stringify({ type: 'msg', content: ciphertext }));
     return true;
   }
 
   // ===== UI wiring =====
-  function showChat() {
-    setup.classList.add('hidden');
-    chatScreen.classList.remove('hidden');
-    document.body.classList.add('chat-active');
-  }
-  function showSetup() {
-    chatScreen.classList.add('hidden');
-    setup.classList.remove('hidden');
-    document.body.classList.remove('chat-active');
-  }
-
-  // Track the visible viewport so the iOS keyboard doesn't shove the page around.
-  // We pin chat-screen height to visualViewport.height when available.
-  const vv = window.visualViewport;
-  function syncViewport() {
-    const h = vv ? vv.height : window.innerHeight;
-    document.documentElement.style.setProperty('--vvh', h + 'px');
-    if (document.body.classList.contains('chat-active')) {
-      // Keep the latest message in view when the keyboard opens/closes.
-      requestAnimationFrame(scrollToBottom);
-    }
-  }
-  if (vv) {
-    vv.addEventListener('resize', syncViewport);
-    vv.addEventListener('scroll', syncViewport);
-  } else {
-    window.addEventListener('resize', syncViewport);
-  }
-  syncViewport();
-
   connectBtn.addEventListener('click', () => {
     const server = $('f-server').value.trim();
     const room   = $('f-room').value.trim();
@@ -766,6 +781,12 @@
     if (!room)   { setupErr.textContent = '请输入房间号';     return; }
     if (!name)   { setupErr.textContent = '请输入代号';       return; }
 
+    let parsed;
+    try { parsed = parsePsk(server); }
+    catch (e) { setupErr.textContent = e.message; return; }
+    cleanServerUrl = parsed.cleanUrl;
+    keyBytes = parsed.keyBytes;
+
     localStorage.setItem(LS.server, server);
     localStorage.setItem(LS.room,   room);
     localStorage.setItem(LS.name,   name);
@@ -774,7 +795,8 @@
     stopped = false;
     attempt = 0;
 
-    showChat();
+    setup.classList.add('hidden');
+    chatScreen.classList.remove('hidden');
     metaRoom.textContent = room;
     log.innerHTML = '';
     input.focus();
@@ -788,44 +810,12 @@
     }
   });
 
-  // Pull a ws/wss/http(s) URL out of free-form text like
-  //   "export CHAT_SERVER=wss://foo.trycloudflare.com"
-  //   "CHAT_SERVER=wss://foo.trycloudflare.com"
-  //   "the server is wss://foo.com, please use it"
-  function extractServerUrl(text) {
-    if (!text) return '';
-    const t = String(text).trim().replace(/^['"]|['"]$/g, '');
-    const m = t.match(/\b(?:wss?|https?):\/\/[^\s'"`<>]+/i);
-    if (m) return m[0].replace(/[.,;]+$/, '');
-    // Fall back: strip a leading "export FOO=" / "FOO=" prefix
-    const eq = t.match(/^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.+)$/);
-    if (eq) return eq[1].trim().replace(/^['"]|['"]$/g, '');
-    return t;
-  }
-
-  async function pasteIntoServer() {
+  pasteBtn.addEventListener('click', async () => {
     try {
       const text = await navigator.clipboard.readText();
-      const extracted = extractServerUrl(text);
-      if (extracted) {
-        $('f-server').value = extracted;
-        $('f-server').focus();
-      }
+      if (text) $('f-server').value = text.trim();
     } catch {
-      // Clipboard API blocked (e.g. no permission). Focus so user can ⌘V manually.
       $('f-server').focus();
-    }
-  }
-  pasteBtn.addEventListener('click', pasteIntoServer);
-
-  // Smart paste straight into the server field too — handles ⌘V / right-click paste.
-  $('f-server').addEventListener('paste', (e) => {
-    const data = e.clipboardData && e.clipboardData.getData('text');
-    if (!data) return;
-    const extracted = extractServerUrl(data);
-    if (extracted && extracted !== data.trim()) {
-      e.preventDefault();
-      $('f-server').value = extracted;
     }
   });
 
@@ -833,7 +823,8 @@
     disconnect();
     setStatus('未连接');
     sendBtn.disabled = true;
-    showSetup();
+    chatScreen.classList.add('hidden');
+    setup.classList.remove('hidden');
   });
 
   // Auto-grow textarea
@@ -854,34 +845,20 @@
     }
   });
 
-  $('composer').addEventListener('submit', (e) => {
+  $('composer').addEventListener('submit', async (e) => {
     e.preventDefault();
     const text = input.value;
     if (!text.trim()) return;
-    if (send(text.slice(0, 4000))) {
-      input.value = '';
-      autosize();
-      sendBtn.disabled = true;
+    sendBtn.disabled = true;
+    try {
+      if (await send(text.slice(0, 4000))) {
+        input.value = '';
+        autosize();
+      }
+    } catch (err) {
+      appendSys(`加密失败: ${err.message}`);
     }
   });
-
-  // iOS occasionally scrolls the document when the textarea gets focus.
-  // Snap it back and re-pin the log to the bottom.
-  input.addEventListener('focus', () => {
-    setTimeout(() => {
-      window.scrollTo(0, 0);
-      scrollToBottom();
-    }, 50);
-  });
-
-  // Block rubber-band scroll on iOS for everything except the message log
-  // and the textarea itself. This stops the "page floats below the input" feel.
-  document.addEventListener('touchmove', (e) => {
-    if (!document.body.classList.contains('chat-active')) return;
-    const t = e.target;
-    if (t && (log.contains(t) || t === input)) return;
-    e.preventDefault();
-  }, { passive: false });
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && ws && ws.readyState === WebSocket.CLOSED && !stopped) {
