@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover,interactive-widget=resizes-content" />
 <meta name="theme-color" content="#000000" id="meta-theme-color" />
 <title>404 未找到</title>
 <script>
@@ -61,12 +61,18 @@
   }
 
   * { box-sizing: border-box; }
+  html {
+    /* Lock zoom on iOS Safari, which ignores user-scalable=no in some versions. */
+    touch-action: manipulation;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
   html, body {
     margin: 0;
     padding: 0;
     background: var(--bg);
     color: var(--fg);
-    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font: 15px/1.5 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", monospace;
     -webkit-font-smoothing: antialiased;
     -webkit-tap-highlight-color: transparent;
   }
@@ -76,6 +82,16 @@
     display: flex;
     flex-direction: column;
     overscroll-behavior: none;
+  }
+
+  /* When chat is active we lock the page so iOS won't reflow on keyboard open. */
+  body.chat-active {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
   }
 
   .hidden { display: none !important; }
@@ -150,10 +166,10 @@
     border-radius: 10px;
     padding: 12px 14px;
     font: inherit;
-    font-size: 15px;
     color: var(--fg);
     outline: none;
     -webkit-appearance: none;
+    appearance: none;
     transition: border-color .15s, background .15s;
   }
   .field input:focus {
@@ -213,6 +229,11 @@
     min-height: 0;
     background: var(--bg);
   }
+  body.chat-active #chat-screen {
+    /* Track the visible viewport so the bar stays glued to the top
+       and the composer rides up with the keyboard, no jumping. */
+    height: var(--vvh, 100dvh);
+  }
 
   #bar {
     display: flex;
@@ -265,6 +286,7 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 8px 0;
     -webkit-overflow-scrolling: touch;
     display: flex;
@@ -334,13 +356,13 @@
     border-radius: 20px;
     padding: 10px 14px;
     font: inherit;
-    font-size: 15px;
     color: var(--fg);
     outline: none;
     resize: none;
     max-height: 120px;
     line-height: 1.4;
     -webkit-appearance: none;
+    appearance: none;
   }
   #composer textarea:focus {
     border-color: var(--accent);
@@ -705,6 +727,36 @@
   }
 
   // ===== UI wiring =====
+  function showChat() {
+    setup.classList.add('hidden');
+    chatScreen.classList.remove('hidden');
+    document.body.classList.add('chat-active');
+  }
+  function showSetup() {
+    chatScreen.classList.add('hidden');
+    setup.classList.remove('hidden');
+    document.body.classList.remove('chat-active');
+  }
+
+  // Track the visible viewport so the iOS keyboard doesn't shove the page around.
+  // We pin chat-screen height to visualViewport.height when available.
+  const vv = window.visualViewport;
+  function syncViewport() {
+    const h = vv ? vv.height : window.innerHeight;
+    document.documentElement.style.setProperty('--vvh', h + 'px');
+    if (document.body.classList.contains('chat-active')) {
+      // Keep the latest message in view when the keyboard opens/closes.
+      requestAnimationFrame(scrollToBottom);
+    }
+  }
+  if (vv) {
+    vv.addEventListener('resize', syncViewport);
+    vv.addEventListener('scroll', syncViewport);
+  } else {
+    window.addEventListener('resize', syncViewport);
+  }
+  syncViewport();
+
   connectBtn.addEventListener('click', () => {
     const server = $('f-server').value.trim();
     const room   = $('f-room').value.trim();
@@ -722,8 +774,7 @@
     stopped = false;
     attempt = 0;
 
-    setup.classList.add('hidden');
-    chatScreen.classList.remove('hidden');
+    showChat();
     metaRoom.textContent = room;
     log.innerHTML = '';
     input.focus();
@@ -737,12 +788,44 @@
     }
   });
 
-  pasteBtn.addEventListener('click', async () => {
+  // Pull a ws/wss/http(s) URL out of free-form text like
+  //   "export CHAT_SERVER=wss://foo.trycloudflare.com"
+  //   "CHAT_SERVER=wss://foo.trycloudflare.com"
+  //   "the server is wss://foo.com, please use it"
+  function extractServerUrl(text) {
+    if (!text) return '';
+    const t = String(text).trim().replace(/^['"]|['"]$/g, '');
+    const m = t.match(/\b(?:wss?|https?):\/\/[^\s'"`<>]+/i);
+    if (m) return m[0].replace(/[.,;]+$/, '');
+    // Fall back: strip a leading "export FOO=" / "FOO=" prefix
+    const eq = t.match(/^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.+)$/);
+    if (eq) return eq[1].trim().replace(/^['"]|['"]$/g, '');
+    return t;
+  }
+
+  async function pasteIntoServer() {
     try {
       const text = await navigator.clipboard.readText();
-      if (text) $('f-server').value = text.trim();
+      const extracted = extractServerUrl(text);
+      if (extracted) {
+        $('f-server').value = extracted;
+        $('f-server').focus();
+      }
     } catch {
+      // Clipboard API blocked (e.g. no permission). Focus so user can ⌘V manually.
       $('f-server').focus();
+    }
+  }
+  pasteBtn.addEventListener('click', pasteIntoServer);
+
+  // Smart paste straight into the server field too — handles ⌘V / right-click paste.
+  $('f-server').addEventListener('paste', (e) => {
+    const data = e.clipboardData && e.clipboardData.getData('text');
+    if (!data) return;
+    const extracted = extractServerUrl(data);
+    if (extracted && extracted !== data.trim()) {
+      e.preventDefault();
+      $('f-server').value = extracted;
     }
   });
 
@@ -750,8 +833,7 @@
     disconnect();
     setStatus('未连接');
     sendBtn.disabled = true;
-    chatScreen.classList.add('hidden');
-    setup.classList.remove('hidden');
+    showSetup();
   });
 
   // Auto-grow textarea
@@ -782,6 +864,24 @@
       sendBtn.disabled = true;
     }
   });
+
+  // iOS occasionally scrolls the document when the textarea gets focus.
+  // Snap it back and re-pin the log to the bottom.
+  input.addEventListener('focus', () => {
+    setTimeout(() => {
+      window.scrollTo(0, 0);
+      scrollToBottom();
+    }, 50);
+  });
+
+  // Block rubber-band scroll on iOS for everything except the message log
+  // and the textarea itself. This stops the "page floats below the input" feel.
+  document.addEventListener('touchmove', (e) => {
+    if (!document.body.classList.contains('chat-active')) return;
+    const t = e.target;
+    if (t && (log.contains(t) || t === input)) return;
+    e.preventDefault();
+  }, { passive: false });
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && ws && ws.readyState === WebSocket.CLOSED && !stopped) {
